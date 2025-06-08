@@ -1,0 +1,1353 @@
+---
+title: "Temporal trends in mortality and readmission after acute heart failure : A systematic review and meta-regression in the past four decades"
+author: "Antoine Kimmoun, Thomas Merkling & Etienne Gayat"
+output:
+  html_document:
+    code_folding: hide
+    theme: journal
+    toc: yes
+    toc_float: yes
+  pdf_document:
+    toc: yes
+  word_document: null
+editor_options:
+  chunk_output_type: console
+always_allow_html: yes
+---
+
+<style type="text/css">
+
+h1.title {
+  font-size: 38px;
+  text-align: center;
+}
+h4.author { /* Header 4 - and the author and data headers use this too  */
+    font-size: 18px;
+  font-family: "Times New Roman", Times, serif;
+  text-align: center;
+}
+h4.date { /* Header 4 - and the author and data headers use this too  */
+  font-size: 18px;
+  font-family: "Times New Roman", Times, serif;
+  text-align: center;
+}
+</style>
+
+This code works best if the whole structure deposited on OSF has been downloaded and a R project has been created in the root directory.
+Figure and table number refer to those in the published paper.
+
+
+```{r, echo=FALSE}
+knitr::opts_chunk$set(error = FALSE)
+```
+
+
+```{r setup, include=FALSE}
+knitr::opts_knit$set(root.dir = rprojroot::find_rstudio_root_file())
+# markdown options depending on the output (html with R code and Word without)
+output <- knitr::opts_knit$get("rmarkdown.pandoc.to")
+if (output=="html") knitr::opts_chunk$set(message=FALSE, warning=FALSE, echo = TRUE, comment = "", fig.align = "center", fig.width= 17, fig.asp =0.70, out.width = "90%")
+if (output=="docx") knitr::opts_chunk$set(message=FALSE, warning=FALSE, echo = FALSE, comment = "", fig.align = "center", fig.width= 17, fig.asp =0.70, out.width = "90%")
+if (output=="pdf") knitr::opts_chunk$set(message=FALSE, warning=FALSE, echo = FALSE, comment = "", fig.align = "center", fig.width= 17, fig.asp =0.70, out.width = "90%")
+
+options(max.print = .Machine$integer.max)
+```
+
+```{r}
+#Packages needed:
+require(metafor)
+library(readxl)
+library(tidyverse) # need the last version of dplyr (1.0.2) to work
+library(grid)
+library(PropCIs)
+library(emmeans) # need the last version (1.5.3) to work
+library(broom)
+library(flextable)
+library(patchwork)
+library(rms)
+library(maps)
+```
+
+```{r}
+# downloading required functions
+source("functions/R_functions_Kimmoun_et_al_final.R")
+source("functions/rob.summary.R")
+```
+
+```{r}
+DATA <- read.csv2("data/clean_data_Kimmoun_et_al.csv", na.strings =c(""," ","NA"))
+
+qos <- data.frame(read_excel("data/qos.xlsx"))
+
+# PMID of MEDICARE studies
+MEDICARE_ID <- c(10074960, 16828634, 28719692, 19064833)
+```
+
+
+The results presented here are based on a comprehensive and systematic literature review of AHF studies between 1980 and 2017 in which acute heart failure-related mortality and/or readmission rate were reported as primary or secondary outcomes. See more details concerning the literature search in the corresponding publication.
+
+# Distribution of AHF studies in the world for graphical abstract
+
+```{r}
+# creates a vector with number of studies per country to input on the map
+countries_long <- DATA %>% 
+                        dplyr::select(c(PMID, contains("country"))) %>%
+                        group_by(PMID) %>%
+                        filter(row_number()==1) %>% 
+                        ungroup() %>% 
+                        pivot_longer(cols = contains("country")) %>% 
+                        filter(!is.na(value)) %>% 
+                        count(value)
+```
+
+```{r fig.width=15, fig.height=10}
+# combine number of studies with a world map
+map.world <- map_data("world")
+
+map.world_joined <- left_join(map.world, countries_long, by = c('region' = 'value'))
+
+AHF_map <- ggplot(data = map.world_joined, aes(x = long, y = lat, group = group, fill = n)) +
+  geom_polygon(colour = alpha("black", 1/2)) +
+theme(text = element_text(family = "Gill Sans", color = "black")
+      ,panel.background = element_rect(fill = "lightblue")
+      ,plot.background = element_rect(fill = "white")
+      ,panel.grid = element_blank()
+      ,plot.title = element_text(size = 30)
+      ,plot.subtitle = element_text(size = 10)
+      ,axis.text = element_blank()
+      ,axis.title = element_blank()
+      ,axis.ticks = element_blank()
+      ,legend.position = "bottom")+
+  labs(fill = "Number of studies achieved by each country")+
+scale_fill_gradient2(low="blue", mid="pink",midpoint = 30, high="red", na.value="white")
+AHF_map
+```
+
+```{r eval = FALSE}
+ggsave("figures/world_map.tiff", width = 20, height = 15, units = "cm", dpi = 300)
+```
+
+
+# Figures 1 & S2 & Table S2: Patients' characteristics and comorbidities: effect of time period
+
+For each patient's characteristics and comorbidities we want to see how it changed over time by representing the proportions per time period using weighted logistic regressions in a table and the overall temporal trends in a figure.
+
+For continuous patient's characteristics (age, SBP, HR and LVEF), around 40% of the studies did not give mean and SD, so median values were used instead. We chose cutoff values for those variables and calculated the proportion of studies above the cutoff.
+
+```{r}
+# Creating a 4-category variable for Time (with 2005 as boundary as it is when definition of HF changed)
+
+DATA <- DATA %>% mutate(TIMEq =  ifelse(TIME<=2005, 0, 1),
+                        TIMEper = fct_relevel(as_factor(ifelse(TIME <= 2000, "1981-2000", ifelse(TIME <=2005, "2001-2005", ifelse(TIME <= 2010, "2006-2010", "2011-2015")))), "1981-2000"),
+                        MEDICARE = as_factor(ifelse(PMID %in% MEDICARE_ID, "Medicare", "Not Medicare")))
+```
+
+
+```{r}
+# creating cutoff variables for age, heart rate, systolic blood pressure based on the median in the dataset
+# for ejection fraction we set the threshold at 40% as it is the accepted threshold
+
+med_age <- round(median(DATA$AGE_all, na.rm = TRUE),2)
+med_HR <- round(median(DATA$HR_all, na.rm = TRUE),2)
+med_SBP <- round(median(DATA$SBP_all, na.rm = TRUE),2)
+med_SR <- round(median(DATA$all_gender_male_rate, na.rm = TRUE),4)
+
+DATA <- DATA %>% mutate(AGE_bin = ifelse(AGE_all >= med_age, 1, 0),
+                        HR_bin = ifelse(HR_all >= med_HR, 1, 0),
+                        SBP_bin = ifelse(SBP_all >= med_SBP, 1, 0),
+                        EF_bin = ifelse(EF_all >= 40, 1, 0),
+                        SR_bin = ifelse(all_gender_male_rate >= med_SR, 1, 0))
+
+matpred <- rbind(c(0,0,0), c(1,0,0), c(0,1,0), c(0,0,1))
+
+
+tab1 <- matrix(NA,ncol=12,nrow=19)
+tab1[1,1] <- "Demography"
+tab1[2,] <- CAT("AGE_bin", "Age >= 74 years old", "TIMEper", "chisq")
+tab1[3,] <- PROP1("all_gender_male", "number_ttt", "Male ratio", "TIMEper")
+
+tab1[4,1] <- "Medical history"
+tab1[5,] <- PROP1("HF_all_n", "number_ttt", "Heart failure", "TIMEper")
+tab1[6,] <- PROP1("all_CAD.IHD_n", "number_ttt", "Coronary artery disease", "TIMEper")
+tab1[7,] <- PROP1("all_HT_n", "number_ttt", "Hypertension","TIMEper")
+tab1[8,] <- PROP1("all_Afib_n", "number_ttt", "Atrial fibrillation", "TIMEper")
+tab1[9,] <- PROP1("all_DM_n", "number_ttt", "Diabetes mellitus", "TIMEper")
+tab1[10,] <- PROP1("all_COPD_n", "number_ttt", "Chronic obstructive \nrespiratory disease", "TIMEper")
+
+tab1[11,1] <- "Treatment at admission"
+tab1[12,] <- PROP1("all_ACE_ARB_adm_n", "number_ttt", "ACEi and/or ARB", "TIMEper")
+tab1[13,] <- PROP1("A_all_diuretic_n", "number_ttt", "Loop diuretics", "TIMEper")
+tab1[14,] <- PROP1("A_all_B_n", "number_ttt", "Beta-blockers", "TIMEper")
+tab1[15,] <- PROP1("A_all_digoxin_n", "number_ttt", "Digoxin", "TIMEper")
+
+tab1[16,1] <- "Clinical characteristics"
+tab1[17,] <- CAT("SBP_bin", "Systolic blood pressure >= 135 mmHg", "TIMEper", "chisq")
+tab1[18,] <- CAT("HR_bin", "Heart rate >= 87 bpm", "TIMEper", "chisq")
+tab1[19,] <- CAT("EF_bin", "Ejection fraction < 40%", "TIMEper", "fisher")
+
+
+colnames(tab1)<-c("Reported \ncharacteristics","n study", "Total % \n(95%CI)", "n study\n 1981-2000", "1981-2000 \n% (95% CI)", "n study\n2001-2005", "2001-2005\n% (95% CI)", "n study\n2006-2010", "2006-2010\n(95% CI)", "n study\n2011-2015", "2011-2015\n(95% CI)", "p-value")
+
+flextable(as.data.frame(tab1)) %>% autofit() %>%
+      set_caption("Table S2: Reported clinical characteristics of acute heart failure patients at admission in relation to time period") %>% 
+      align(j = c(2:12), align = "center", part = "all") %>%
+      align(j = 1, align = "left", part = "all") %>%
+      fontsize(size = 9, part = "all") %>% 
+      width(width = dim(.)$widths *10 / sum(dim(.)$widths))
+```
+
+For the continuous variables mentioned above (age, SBP, HR and LVEF), we represented raw values and predictions from a weighted linear regression with the mean/median value of each study as the response variable, year of recruitment as the predictor and log(study size) as the weight.
+For the other variables, we represented raw proportions and predictions from a weighted logistic regression with the same predictor and weights.
+
+```{r}
+# Age
+Age_recruit <- wtlin_plot("number_ttt", "TIME", "AGE_all", seq(from = 1985, to = 2015, by = 1), "", "Age (years)", c(40,90), "", 0.15, "%")
+
+# Male ratio
+SR_recruit <- wtlogis_plot("number_ttt", "TIME", "all_gender_male", seq(from = 1985, to = 2015, by = 1), "", "Male ratio (%)", c(0,100), "", 0.15, "%")
+
+# HF
+HF_recruit <- wtlogis_plot("number_ttt", "TIME", "HF_all_n", seq(from = 1992, to = 2013, by = 1), "", "Heart failure (%)", c(-3,103), "", 0.15, "%")
+
+# CHD
+CHD_recruit <- wtlogis_plot("number_ttt", "TIME", "all_CAD.IHD_n", seq(from = 1985, to = 2015, by = 1), "", "Coronary heart\ndisease (%)", c(0,100), "", 0.8, "%")
+
+# HTA
+hta_recruit <- wtlogis_plot("number_ttt", "TIME", "all_HT_n", seq(from = 1985, to = 2015, by = 1), "Year of recruitment", "Hypertension (%)", c(0,100), "", 0.8, "%")
+
+# Atrial fibrillation
+afib_recruit <- wtlogis_plot("number_ttt", "TIME", "all_Afib_n", seq(from = 1985, to = 2015, by = 1), "Year of recruitment", "Atrial fibrillation (%)", c(0,100), "", 0.8, "%")
+
+# Diabetes mellitus
+diab_recruit <- wtlogis_plot("number_ttt", "TIME", "all_DM_n", seq(from = 1985, to = 2015, by = 1), "", "Diabetes mellitus (%)", c(0,100), "", 0.8, "%")
+
+# Chronic obstructive respiratory disease
+CORD_recruit <- wtlogis_plot("number_ttt", "TIME", "all_COPD_n", seq(from = 1985, to = 2015, by = 1), "", "Chronic obstructive \nrespiratory disease(%)", c(0,100), "", 0.8, "%")
+
+# SBP
+SBP_recruit <- wtlin_plot("number_ttt", "TIME", "SBP_all", seq(from = 1993, to = 2015, by = 1), "", "SBP (mmHg)", c(80,180), "", 0.15, "mmHg")
+
+# HR
+HR_recruit <- wtlin_plot("number_ttt", "TIME", "HR_all", seq(from = 1995, to = 2015, by = 1), "Year of recruitment", "Hear rate (bpm)", c(50,120), "", 0.15, "bpm")
+
+# EF
+EF_recruit <- wtlin_plot("number_ttt", "TIME", "EF_all", seq(from = 1993, to = 2015, by = 1), "Year of recruitment", "Ejection fraction (%)", c(10,70), "", 0.15, "%")
+
+```
+  
+```{r fig.cap="Figure 1", fig.width=20, fig.height=60, out.height="110%"}
+HF_plot <- HF_recruit[[2]] + scale_x_continuous(breaks = c(1985,1995,2005, 2015), limits = c(1983,2017)) # changing spacing in x labels
+fig1 <- (Age_recruit[[2]] + SR_recruit[[2]])/
+        (HF_plot + CHD_recruit[[2]])/ 
+        (hta_recruit[[2]] + afib_recruit[[2]]) + 
+        plot_annotation(tag_levels = 'A')  & theme(plot.tag = element_text(size = 30))
+fig1
+```
+
+```{r eval = FALSE}
+ggsave("figures/Fig_1_trends_CVhist.tiff", width = 40, height = 60, units = "cm", dpi = 300)
+```
+
+```{r fig.cap = "Figure S2", fig.width=20, fig.height=60, out.height="110%"}
+figS2 <- (diab_recruit[[2]] + CORD_recruit[[2]])/
+        (SBP_recruit[[2]] + HR_recruit[[2]])/
+        (EF_recruit[[2]] + plot_spacer()) + 
+        plot_annotation(tag_levels = 'A')  & theme(plot.tag = element_text(size = 30))
+figS2
+```
+
+```{r eval = FALSE}
+ggsave("figures/Fig_S2_trends_baseline.tiff", width = 40, height = 60, units = "cm", dpi = 300)
+ggsave("figures/Fig_S2_trends_baseline.jpg", width = 40, height = 60, units = "cm", dpi = 300)
+```
+
+# Primary outcomes: AHF-related all-cause death and readmission rates
+
+## Overall effect sizes
+
+```{r}
+# 30 day death rate
+d30d_rate <- rate_ES("death_30_all")
+```
+
+```{r}
+# one-year death rate
+d1y_rate <- rate_ES("death_365")
+```
+
+```{r}
+# 30-day readmission rate
+r30d_rate <- rate_ES("rehosp_30_all.cause_all")
+```
+
+```{r}
+# 1-year readmission rate
+r1y_rate <- rate_ES("rehosp_365")
+```
+
+```{r}
+tab_rate <- bind_rows(d30d_rate[[1]], d1y_rate[[1]], r30d_rate[[1]], r1y_rate[[1]]) %>% mutate(Outcome = c("30-day death", "one-year death", "30-day readmission", "one-year readmission")) %>% dplyr::select(5, 1:4)
+  
+
+tab_rate_flex <- flextable(tab_rate) %>% 
+      set_caption("Meta-analytic means of 30-day and one-year all-cause death and readmision rates") %>% 
+      theme_booktabs() %>% 
+      bold(part = "header") %>% 
+      align(j = c(2:5), align = "center", part = "all") %>%
+      align(j = 1, align = "left", part = "all") %>%
+      autofit() 
+
+tab_rate_flex %>% width(width = dim(.)$widths * 10 / sum(dim(.)$widths)) # setting column width for a maximum width of 10 inches
+```
+
+
+## Effect of recruitment year on AHF-related outcomes
+
+```{r}
+# 30-day death rate
+d30d_recruit <- MA_prop_plot("number_follow_up","TIME", "death_30_all", seq(from = 1990, to = 2017, by = 1), "", "death \n%", c(0,65), "30-day", 0.8)
+
+# one-year death rate
+d1y_recruit <- MA_prop_plot("number_follow_up", "TIME", "death_365", seq(from = 1985, to = 2017, by = 1), "", "%", c(0,75), "one-year", 0.8)
+
+# 30-day readmission rate
+r30d_recruit <- MA_prop_plot("number_follow_up", "TIME", "rehosp_30_all.cause_all", seq(from = 1990, to = 2017, by = 1), "Year of recruitment", "readmission \n%", c(0,65), "", 0.8)
+
+# one-year readmission rate
+r1y_recruit <- MA_prop_plot("number_follow_up", "TIME", "rehosp_365", seq(from = 1990, to = 2017, by = 1), "Year of recruitment", "%", c(0,100), "", 0.85)
+```
+
+
+```{r include = FALSE, eval = FALSE}
+## model checks
+
+# 30-day death
+plot(density(residuals(d30d_recruit[[1]], type = "pearson")))
+
+##sensitivity analysis
+infd30dr=influence(d30d_recruit[[1]])
+print(infd30dr); plot(infd30dr)
+#There are 7 influential studies 
+d30dr.noutlier <- na.omit(DATA[,c("number_follow_up", "TIME", "death_30_all")])
+d30dr.noutlier <- d30dr.noutlier[!infd30dr$is.infl,]
+colnames(d30dr.noutlier)<-c("Ni","time","Ei")
+d30dr.noutlier$time_div <- d30dr.noutlier$time/10
+
+es_d30dr.noutlier = escalc(xi=Ei, ni=Ni, measure="PLO", data=d30dr.noutlier)
+d30dr_time_ML <- rma(yi=yi, mods = ~time_div, vi=vi, data=es_d30dr.noutlier, method = "ML")
+d30dr_ov_ML <- rma(yi=yi, vi=vi, data=es_d30dr.noutlier, method = "ML")
+anova(d30dr_time_ML,d30dr_ov_ML)
+d30dr_noout_OR <- OR_div(rma(yi=yi,mods = ~time_div, vi=vi, data=es_d30dr.noutlier, method = "REML"),anova(d30dr_time_ML,d30dr_ov_ML)[6]) 
+# still significant after removing outliers
+
+# 1-year death
+plot(density(residuals(d1y_recruit[[1]], type = "pearson")))
+
+##sensitivity analysis
+infd1yr=influence(d1y_recruit[[1]])
+print(infd1yr); plot(infd1yr)
+#There are 6 influential studies
+d1yr.noutlier <- na.omit(DATA[,c("number_follow_up", "TIME", "death_365")])
+d1yr.noutlier <- d1yr.noutlier[!infd1yr$is.infl,]
+colnames(d1yr.noutlier)<-c("Ni","time","Ei")
+d1yr.noutlier$time_div <- d1yr.noutlier$time/10
+
+es_d1yr.noutlier = escalc(xi=Ei, ni=Ni, measure="PLO", data=d1yr.noutlier)
+d1yr_time_ML <- rma(yi=yi, mods = ~time_div, vi=vi, data=es_d1yr.noutlier, method = "ML")
+d1yr_ov_ML <- rma(yi=yi, vi=vi, data=es_d1yr.noutlier, method = "ML")
+anova(d1yr_time_ML,d1yr_ov_ML)
+d1yr_noout_OR <- OR_div(rma(yi=yi,mods = ~time_div, vi=vi, data=es_d1yr.noutlier, method = "REML"),anova(d1yr_time_ML,d1yr_ov_ML)[6]) 
+
+# still significant after removing outliers
+
+
+# 30-day readmission
+plot(density(residuals(r30d_recruit[[1]], type = "pearson")))
+
+##sensitivity analysis
+infr30dr=influence(r30d_recruit[[1]])
+print(infr30dr); plot(infr30dr)
+#There are 3 influential studies
+r30dr.noutlier <- na.omit(DATA[,c("number_follow_up", "TIME", "rehosp_30_all.cause_all")])
+r30dr.noutlier <- r30dr.noutlier[!infr30dr$is.infl,]
+colnames(r30dr.noutlier)<-c("Ni","time","Ei")
+r30dr.noutlier$time_div <- r30dr.noutlier$time/10
+
+es_r30dr.noutlier = escalc(xi=Ei, ni=Ni, measure="PLO", data=r30dr.noutlier)
+r30dr_time_ML <- rma(yi=yi, mods = ~time_div, vi=vi, data=es_r30dr.noutlier, method = "ML")
+r30dr_ov_ML <- rma(yi=yi, vi=vi, data=es_r30dr.noutlier, method = "ML")
+anova(r30dr_time_ML,r30dr_ov_ML)
+r30dr_noout_OR <- OR_div(rma(yi=yi,mods = ~time_div, vi=vi, data=es_r30dr.noutlier, method = "REML"),anova(r30dr_time_ML,r30dr_ov_ML)[6]) 
+# not significant anymore after removing outliers
+
+
+# one-year readmission
+plot(density(residuals(r1y_recruit[[1]], type = "pearson")))
+
+##sensitivity analysis
+infr1yr=influence(r1y_recruit[[1]])
+print(infr1yr); plot(infr1yr)
+#There is 1 influential study
+r1yr.noutlier <- na.omit(DATA[,c("number_follow_up", "TIME", "rehosp_365")])
+r1yr.noutlier <- r1yr.noutlier[!infr1yr$is.infl,]
+colnames(r1yr.noutlier)<-c("Ni","time","Ei")
+r1yr.noutlier$time_div <- r1yr.noutlier$time/10
+
+es_r1yr.noutlier = escalc(xi=Ei, ni=Ni, measure="PLO", data=r1yr.noutlier)
+r1yr_time_ML <- rma(yi=yi, mods = ~time_div, vi=vi, data=es_r1yr.noutlier, method = "ML")
+r1yr_ov_ML <- rma(yi=yi, vi=vi, data=es_r1yr.noutlier, method = "ML")
+anova(r1yr_time_ML,r1yr_ov_ML)
+# effect becomes significant after removing influential studies
+
+r1yr_time_REML <- rma(yi=yi, mods = ~time_div, vi=vi, data=es_r1yr.noutlier, method = "REML")
+exp(r1yr_time_REML$b[2]) # OR = 0.70
+exp(r1yr_time_REML$ci.lb[2]) # lower bound = 0.50
+exp(r1yr_time_REML$ci.ub[2]) # lower bound = 0.97
+```
+
+```{r}
+OR_time_tab <- data.frame(Outcome = c("30-day death", "One-year death", "30-day readmission", "One-year readmission"),
+           "OR (CI)" = c(d30d_recruit[[3]][[1]], d1y_recruit[[3]][[1]], r30d_recruit[[3]][[1]], r1y_recruit[[3]][[1]]), 
+                           "P-value" = round(c(d30d_recruit[[3]]$pval, d1y_recruit[[3]]$pval, r30d_recruit[[3]]$pval, r1y_recruit[[3]]$pval),3), check.names = FALSE)
+
+OR_time_tab_flx <-  flextable(OR_time_tab) %>% 
+          autofit() %>% 
+          set_caption("Odds ratios and p-values for the effect of year of recruitment (10 yr increment) on the outcomes") %>% 
+          bold(part = "header") %>% 
+          align(j = c(1), align = "left", part = "all") %>% 
+          align(j = c(2,3), align = "left", part = "all")
+
+OR_time_tab_flx %>% width(width = dim(.)$widths * 10 / sum(dim(.)$widths)) # setting column width for a maximum width of 10 inches
+```
+
+
+## Figure 2: Trends of recruitment year for AHF-related outcomes
+
+```{r fig.width=20, fig.height=20}
+fig2 <- (d30d_recruit[[2]] + d1y_recruit[[2]]) / (r30d_recruit[[2]] + r1y_recruit[[2]]) + plot_annotation(tag_levels = 'A') & 
+  theme(plot.tag = element_text(size = 30))
+fig2
+```
+
+```{r eval = FALSE}
+ggsave("figures/Fig_2_trend_outcomes.tiff", width = 40, height = 40, units = "cm", dpi = 300)
+```
+
+The negative temporal trend remained after removing influential points for 30-day and one-year all-cause deaths. However, for 30-day readmission the positive trend disappeared, while the negative trend for one-year readmission became significant.
+
+
+## Figure 3 and Table S3: Differences among continents in temporal trends
+
+We are interested to see if the mortality trends over time differ among continents, while considering only studies for which all countries involved were on the same continent.
+
+```{r}
+DATA %>% filter(multicontinent == "No" | is.na(multicontinent)) %>% 
+              group_by(continent) %>% 
+              count() %>% flextable() %>% autofit()
+```
+
+For Africa, Oceania and South America, there are too few studies to investigate temporal trends, so we'll focus on Asia, Europe and North America.
+
+```{r}
+DATA_cont <- DATA %>% 
+                  filter((multicontinent == "No" | is.na(multicontinent)) &
+                           (continent == "Asia" | continent == "Europe" | continent == "North_America")) %>% droplevels() %>%
+              mutate(continent = fct_relevel(as_factor(continent), "Asia"))
+```
+
+
+```{r}
+# 30-day death
+mat_cont_d30d <- cbind(c(seq(from = 2000, to = 2017, by = 1), seq(from = 1990, to = 2017, by = 1), seq(from = 1995, to = 2017, by = 1)), 
+      c(rep(0, 18), rep(1,28), rep(0,23)), 
+      c(rep(0, 46), rep(1,23)), 
+      c(rep(0, 18), seq(from = 1990, to = 2017, by = 1), rep(0, 23)), 
+      c(rep(0, 46), seq(from = 1995, to = 2017, by = 1)))
+
+cont_d30d <- sub_OR_cont_fun("number_follow_up","TIME", "death_30_all", "continent", "Europe", "North_America", "30-day death", mat_cont_d30d, "", "death\n(%)", "30-day", c(0,35), 0.9, c(18,28,23))
+
+# one-year death
+mat_cont_d1y <- cbind(rep(seq(from = 1985, to = 2017, by = 1),3), 
+      c(rep(0, 33), rep(1,33), rep(0,33)), 
+      c(rep(0, 66), rep(1,33)), 
+      c(rep(0, 33), seq(from = 1985, to = 2017, by = 1), rep(0, 33)), 
+      c(rep(0, 66), seq(from = 1985, to = 2017, by = 1)))
+
+cont_d1y <- sub_OR_cont_fun("number_follow_up","TIME", "death_365", "continent", "Europe", "North_America", "One-year death", mat_cont_d1y, "", "(%)", "One-year", c(0,67), 0.9, c(33,33,33))
+
+# 30-day readmission
+
+cont_r30d <- sub_OR_cont_fun("number_follow_up","TIME", "rehosp_30_all.cause_all", "continent", "Europe", "North_America", "30-day readmission", mat_cont_d30d, "Year of recruitment", "readmission\n(%)", "", c(0,50), 0.9, c(18,28,23))
+
+# one-year readmission
+mat_cont_r1y <- cbind(rep(seq(from = 1995, to = 2017, by = 1),3), 
+      c(rep(0, 23), rep(1,23), rep(0,23)), 
+      c(rep(0, 46), rep(1,23)), 
+      c(rep(0, 23), seq(from = 1995, to = 2017, by = 1), rep(0, 23)), 
+      c(rep(0, 46), seq(from = 1995, to = 2017, by = 1)))
+
+cont_r1y <- sub_OR_cont_fun("number_follow_up","TIME", "rehosp_365", "continent", "Europe", "North_America", "One-year readmission", mat_cont_r1y, "Year of recruitment", "(%)", "", c(0,100), 0.9, c(23,23,23))
+
+cont_tab <- bind_rows(cont_d30d[[1]], cont_d1y[[1]], cont_r30d[[1]], cont_r1y[[1]])
+```
+
+```{r}
+flx_cont_tab <-  cont_tab %>% 
+                    dplyr::select(c(1:3, 7:9)) %>% 
+                    flextable() %>%
+                    autofit() %>% 
+                    set_caption("Table S3: Odds-ratios (CI) and p-values for the effects of year of recruitment (10 year increment) on outcomes in relation to continent of origin of AHF studies") %>%
+                    bold(part = "header") %>% 
+                    align(j = c(3:6), align = "center", part = "all") %>%
+                    align(j = c(1,2), align = "left", part = "all")
+  
+flx_cont_tab %>% width(width = dim(.)$widths * 10 / sum(dim(.)$widths)) # setting column width for a maximum width of 10 inches
+```
+
+```{r fig.asp = 0.90}
+fig_3_cont_inter <- (cont_d30d[[2]] + cont_d1y[[2]]) / (cont_r30d[[2]] + cont_r1y[[2]]) + plot_annotation(tag_levels = 'A') & 
+  theme(plot.tag = element_text(size = 30), legend.position = "right")
+fig_3_cont_inter + plot_layout(guides = "collect")
+```
+
+```{r eval = FALSE}
+ggsave("figures/Fig_3_inter_cont_time.tiff", width = 40, height = 40, units = "cm", dpi = 300)
+```
+
+
+## Figure S3: Non-linear trends in primary outcomes
+
+We want to check whether the observed temporal trends are indeed linear or if adding a non-linear component improves the fit. As definitions, coding and management of AHF has changed over time, we could expect some non-linear trends reflecting these changes.
+
+```{r}
+# non-linear trends
+
+d30d_recruit_nonlin <- MA_prop_nonlin_plot("number_follow_up","TIME", "death_30_all", seq(from = 1990, to = 2017, by = 1), "", "death \n%", c(0,65), "30-day", 0.8, 3)
+
+d1y_recruit_nonlin <- MA_prop_nonlin_plot("number_follow_up","TIME", "death_365", seq(from = 1985, to = 2017, by = 1), "", "%", c(0,75), "one-year", 0.8, 3)
+
+r30d_recruit_nonlin <- MA_prop_nonlin_plot("number_follow_up","TIME", "rehosp_30_all.cause_all", seq(from = 1990, to = 2017, by = 1), "Year of recruitment", "readmission \n%", c(0,65), "", 0.8, 3)
+
+r1y_recruit_nonlin <- MA_prop_nonlin_plot("number_follow_up","TIME", "rehosp_365", seq(from = 1990, to = 2017, by = 1), "Year of recruitment", "%", c(0,100), "", 0.8, 3)
+```
+
+```{r}
+fig_S3_nonlin <- (d30d_recruit_nonlin[[2]] + d1y_recruit_nonlin[[2]]) / (r30d_recruit_nonlin[[2]] + r1y_recruit_nonlin[[2]]) + plot_annotation(tag_levels = 'A') & 
+  theme(plot.tag = element_text(size = 30))
+fig_S3_nonlin
+```
+
+```{r eval = FALSE}
+ggsave("figures/Fig_S3_nonlinear_trend_outcomes.tiff", width = 40, height = 40, units = "cm", dpi = 300)
+ggsave("figures/Fig_S3_nonlinear_trend_outcomes.jpg", width = 40, height = 40, units = "cm", dpi = 300)
+```
+
+Adding a non-linear component (i.e. a restricted cubic spline) does not improve model fit for one-year mortality neither for readmission outcomes. For 30-day death, it seems that the decrease was stronger between 1990 and 2000 and then slowed down, but it could also be driven by one study with high mortality from 1990, so we are just going to check if it holds true after removing this study.
+
+```{r}
+dat_30d_noout <- na.omit(DATA[,c("number_follow_up", "death_30_all", "TIME")])
+dat_30d_noout <- dat_30d_noout %>% filter(TIME > 1990)
+  colnames(dat_30d_noout)<-c("Ni","Ei","X")
+  dat_30d_noout$X_div <- dat_30d_noout$X/10
+  
+  es_30d_noout <- escalc(
+    xi= Ei,
+    ni =Ni,
+    data = dat_30d_noout, 
+    measure = "PLO",
+    to="if0all")
+  
+  #significance test for non-linear component
+  mod_lin_ML <- rma(yi=yi, vi=vi, mods= ~X, data=es_30d_noout, method = "ML") 
+  mod_nonlin_ML <- rma(yi=yi,mods = ~X + rcspline.eval(X, nk = 3,inclx = FALSE), vi=vi, data=es_30d_noout, method = "ML")
+  pval <- anova(mod_lin_ML, mod_nonlin_ML)[6]
+```
+
+After removing this study the p-value for the non-linear component was `r round(pval$pval,3)`.
+
+
+## Non-linear trends in primary outcomes within continent
+
+In addition to testing for overall non-linear trends, we also want to check if there are some between-continent differences in the linearity of temporal trends. To do this we compare a model with an interaction allowing non-linear relationships (i.e. with a restricted cubic spline) to a model with an interaction constraining a linear relationship.
+
+```{r}
+tab_nonlin_cont <- data.frame(Outcome = c("30-day death", "one-year death", "30-day readmission", "one-year readmission"),
+           "P non-linear interaction" = c(sub_nonlin_cont_fun("number_follow_up", "TIME", "death_30_all", "continent", 3), sub_nonlin_cont_fun("number_follow_up", "TIME", "death_365", "continent", 3), sub_nonlin_cont_fun("number_follow_up", "TIME", "rehosp_30_all.cause_all", "continent", 3), sub_nonlin_cont_fun("number_follow_up", "TIME", "rehosp_365", "continent", 3)),
+           check.names = FALSE)
+
+tab_nonlin_cont_flex <- flextable(tab_nonlin_cont) %>% 
+      set_caption("Tests for non-linear trends in primary outcomes in relation to continent") %>% 
+      bold(part = "header") %>% 
+      align(j = c(2), align = "center", part = "all") %>%
+      align(j = 1, align = "left", part = "all") %>%
+      autofit() 
+
+tab_nonlin_cont_flex %>% width(width = dim(.)$widths * 10 / sum(dim(.)$widths)) # setting column width for a maximum width of 10 inches
+```
+
+None of the interactions are significant, showing that adding a non-linear component in the interaction does not improve the models and suggesting that changes in definitions, coding and management did not influence the temporal trends in any continent.
+
+
+# Association between oral heart failure therapies at admission and AHF-related outcomes
+
+## Figure 4: Temporal trends of reported rates of oral heart failure therapies at admission
+
+```{r}
+# ACEi and/or ARB (RAASi)
+ACEi_recruit_adm <- wtlogis_plot("number_ttt", "TIME", "all_ACE_ARB_adm_n", seq(from = 1990, to = 2017, by = 1), "", "RAASi (%)", c(0,100), "", 0.15, "%")
+
+# Diuretics
+diur_recruit_adm <- wtlogis_plot("number_ttt", "TIME", "A_all_diuretic_n", seq(from = 1990, to = 2017, by = 1), "Year of recruitment", "Diuretics (%)", c(0,100), "", 0.15, "%")
+
+# Beta-blockers
+BB_recruit_adm <- wtlogis_plot("number_ttt", "TIME", "A_all_B_n", seq(from = 1990, to = 2017, by = 1), "", "Beta-blocker (%)", c(0,120), "", 0.8, "%")
+
+# Digoxin
+digo_recruit_adm <- wtlogis_plot("number_ttt", "TIME", "A_all_digoxin_n", seq(from = 1990, to = 2017, by = 1), "Year of recruitment", "Digoxin (%)", c(0,100), "", 0.8, "%")
+```
+
+Here we represent weighted logistic regressions with log(study size) as weights.
+
+```{r fig.width=20, fig.height=20}
+fig4 <- (BB_recruit_adm[[2]] + ACEi_recruit_adm[[2]])/ (diur_recruit_adm[[2]] + digo_recruit_adm[[2]]) + plot_annotation(tag_levels = 'A')  & theme(plot.tag = element_text(size = 30))
+fig4
+```
+
+```{r eval = FALSE}
+ggsave("figures/Fig_4_trend_therapies.tiff", width = 40, height = 40, units = "cm", dpi = 300)
+```
+
+```{r}
+OR_tt_time_tab <- data.frame(Outcome = c("RAASi", "Diuretics", "Beta-blockers", "Digoxin"),
+           "OR (CI)" = c(ACEi_recruit_adm[[3]][[1]], diur_recruit_adm[[3]][[1]], BB_recruit_adm[[3]][[1]], digo_recruit_adm[[3]][[1]]), 
+                           "P-value" = c(ACEi_recruit_adm[[3]][[2]], diur_recruit_adm[[3]][[2]], BB_recruit_adm[[3]][[2]], digo_recruit_adm[[3]][[2]]), check.names = FALSE)
+
+OR_tt_time_tab_flx <-  flextable(OR_tt_time_tab) %>% 
+          autofit() %>% 
+          set_caption("Odds ratios and p-values for the effect of year of recruitment (10 yr increment) on treatment prescriptions") %>% 
+          bold(part = "header") %>% 
+          align(j = c(1), align = "left", part = "all") %>% 
+          align(j = c(2,3), align = "left", part = "all")
+
+OR_tt_time_tab_flx %>% width(width = dim(.)$widths * 10 / sum(dim(.)$widths)) # setting column width for a maximum width of 10 inches
+```
+
+
+## Table S4: Summary table for the effect of oral heart failure therapies at admission on 30-day death
+
+
+```{r}
+# getting treatment prescription rates on a percentage scale
+DATA <- DATA %>% mutate(ACE_ARB_admrate_100 = all_ACE_ARB_adm_rate *100,
+                        BB_admrate_100 = A_all_B_rate * 100,
+                        diur_admrate_100 = A_all_diuretic_rate * 100,
+                        digox_admrate_100 = A_all_digoxin_rate * 100)
+
+## Effects of oral heart failure therapies on 30-day death
+
+## In the MA_prop_plot_adj function, the figure produced is only adjusted in year of recruitment but OR are calculated in two ways: while further adjusting on other variables depending on sample sizes (fourth element) or not (fifth element)
+
+# ACEi and/or ARB (RAASi)
+admACEi_death_30d <- MA_prop_plot_adj("number_follow_up", "ACE_ARB_admrate_100", "TIME", "type_Obsv_0_trial_1", "mono0_multi1", "death_30_all", seq(from = 20, to = 90, by = 5), 2003, "RAASi (%)", "30-day death (%)", c(0,40), "", 0.8)
+# adjusted on study type and mono vs multicentric
+
+# Diuretics
+admdiur_death_30d <- MA_prop_plot_adj("number_follow_up", "diur_admrate_100", "TIME", "type_Obsv_0_trial_1", "mono0_multi1", "death_30_all", seq(from = 30, to = 100, by = 5), 2003, "Diuretics (%)", "30-day death (%)", c(0,40), "", 0.8)
+# not adjusted
+
+# Beta-blockers
+admBB_death_30d <- MA_prop_plot_adj("number_follow_up", "BB_admrate_100", "TIME", "type_Obsv_0_trial_1", "mono0_multi1", "death_30_all", seq(from = 10, to = 100, by = 5), 2003, "Beta-blocker (%)", "30-day death (%)", c(0,40), "", 0.8)
+# adjusted on study type and mono vs mutlicentric
+
+# Digoxin
+admdigo_death_30d <- MA_prop_plot_adj("number_follow_up", "digox_admrate_100", "TIME", "type_Obsv_0_trial_1", "mono0_multi1", "death_30_all", seq(from = 5, to = 60, by = 5), 2003,  "Digoxin (%)", "30-day death (%)", c(0,40), "", 0.8)
+# not adjusted
+```
+
+
+```{r}
+summ_ttt_adm <- data.frame(Treatment = c("RAASi", "Diuretics", "Beta-blockers", "Digoxin"),
+                           "OR (CI) " = c(admACEi_death_30d[[5]][[1]], admdiur_death_30d[[5]][[1]], admBB_death_30d[[5]][[1]], admdigo_death_30d[[5]][[1]]), 
+                           "P-value " = round(c(admACEi_death_30d[[5]]$pval, admdiur_death_30d[[5]]$pval, admBB_death_30d[[5]]$pval, admdigo_death_30d[[5]]$pval),3), check.names = FALSE)
+
+typo_adm <- data.frame(col_keys = colnames(summ_ttt_adm), 
+                       type = c("", rep("30-day death", 2)),
+                       col = c("Treatment", "OR (CI)", "P-value"), stringsAsFactors = FALSE)
+
+flx_summ_ttt_adm <-  flextable(summ_ttt_adm) %>%
+                    autofit() %>% 
+                    set_caption("Table S4: Odds-ratio (CI) and p-value for the effects of oral heart failure therapies at admission on 30-day all-cause death") %>%
+                    set_header_df(mapping = typo_adm, key = "col_keys") %>% 
+                    merge_h(part = "header") %>% 
+                    merge_v(part = "header") %>% 
+                    theme_booktabs() %>% 
+                    bold(part = "header") %>% 
+                    align(j = c(2:3), align = "center", part = "all") %>%
+                    align(j = 1, align = "left", part = "all") %>%
+                    add_footer(`Treatment` = "For all analyses, year of recruitment was added as a moderator.") %>% 
+                   merge_at(j = 1:3, part = "footer") 
+  
+flx_summ_ttt_adm %>% width(width = dim(.)$widths * 10 / sum(dim(.)$widths)) # setting column width for a maximum width of 10 inches
+```
+
+Odds-ratio are calculated using a 10% increment of cardiovascular treatments.
+
+
+## Figure 5: Meta-regression for the effect of oral heart failure therapies prescribed at admission on 1-year all-cause death
+
+```{r}
+## Effects of cardiovascular treatments on 1-year death
+
+## In the MA_prop_plot_adj function, the figure produced is only adjusted in year of recruitment but OR are calculated in two ways: while further adjusting on other variables depending on sample sizes (fourth element) or not (fifth element)
+
+# ACEi and/or ARB (RAASi)
+admACEi_death_1y <- MA_prop_plot_adj("number_follow_up", "ACE_ARB_admrate_100", "TIME", "type_Obsv_0_trial_1", "mono0_multi1", "death_365", seq(from = 20, to = 90, by = 5), 2003, "RAASi (%)", "", c(0,70), "", 0.9)
+# adjusted on study type and mono vs multicentric
+
+# Diuretics
+admdiur_death_1y <- MA_prop_plot_adj("number_follow_up", "diur_admrate_100", "TIME", "type_Obsv_0_trial_1", "mono0_multi1", "death_365", seq(from = 30, to = 100, by = 5), 2003, "Diuretics (%)", "One-year death (%)", c(0,70), "", 0.9)
+# adjusted on mono vs multicentric
+
+# Beta-blockers
+admBB_death_1y <- MA_prop_plot_adj("number_follow_up", "BB_admrate_100", "TIME","type_Obsv_0_trial_1", "mono0_multi1", "death_365", seq(from = 10, to = 100, by = 5), 2003, "Beta-blocker (%)", "One-year death (%)", c(0,70), "", 0.9)
+# adjusted on mono vs multicentric
+
+# Digoxin
+admdigo_death_1y <- MA_prop_plot_adj("number_follow_up", "digox_admrate_100", "TIME", "type_Obsv_0_trial_1", "mono0_multi1", "death_365", seq(from = 5, to = 60, by = 5), 2003,  "Digoxin (%)", "", c(0,70), "",0.9)
+# adjusted on mono vs multicentric
+```
+
+```{r fig.width=20, fig.height=20}
+fig5 <- (admBB_death_1y[[3]] +admACEi_death_1y[[3]])/(admdiur_death_1y[[3]] + admdigo_death_1y[[3]]) + plot_annotation(tag_levels = 'A') & theme(plot.tag = element_text(size = 30))
+fig5
+```
+
+For those analyses we also added year of recruitment as a moderator, model predictions are shown for a median year of 2003.
+
+```{r eval = FALSE}
+ggsave("figures/Fig_5_therapies_1yrdeath.tiff", width = 40, height = 40, units = "cm", dpi = 100)
+```
+
+
+## Table S5: Combined effect of RAASi and beta-blockers at admission on 30-day and one-year death
+
+For these analyses, we created a four-class variable describing the combination of high and low (i.e. above and below the median, respectively) percentages of prescription of RAASi and beta-blockers.
+
+```{r}
+# getting median values of percentage of RAASi (ACE/ARB) and beta-blockers prescriptions at admission
+med_ACE_adm_1y <- median(na.omit(DATA[,c("death_365","ACE_ARB_admrate_100")])$ACE_ARB_admrate_100) 
+med_BB_adm_1y <- median(na.omit(DATA[,c("death_365","BB_admrate_100")])$BB_admrate_100) 
+med_ACE_adm_30d <- median(na.omit(DATA[,c("death_30_all","ACE_ARB_admrate_100")])$ACE_ARB_admrate_100) 
+med_BB_adm_30d <- median(na.omit(DATA[,c("death_30_all","BB_admrate_100")])$BB_admrate_100) 
+
+DATA <- DATA %>% 
+  mutate(ACE_bin_1y = ifelse(ACE_ARB_admrate_100 > med_ACE_adm_1y, "high RAASi", "low RAASi"),
+                        BB_bin_1y = ifelse(BB_admrate_100 > med_BB_adm_1y, "high BBs", "low BBs"),
+                        ACE_bin_30d = ifelse(ACE_ARB_admrate_100 > med_ACE_adm_30d, "high RAASi", "low RAASi"), BB_bin_30d = ifelse(BB_admrate_100 > med_BB_adm_30d, "high BBs", "low BBs")) %>% 
+                mutate(ACE_BB_1ycat = fct_relevel(as_factor(ifelse(ACE_bin_1y == "high RAASi" & BB_bin_1y == "high BBs", "high RAASi\n& high BBs", 
+                                  ifelse(ACE_bin_1y == "high RAASi" & BB_bin_1y == "low BBs", "high RAASi\n& low BBs",
+                                  ifelse(ACE_bin_1y == "low RAASi" & BB_bin_1y == "high BBs", "low RAASi\n& high BBs", "low RAASi\n& low BBs")))), "low RAASi\n& low BBs", "high RAASi\n& low BBs", "low RAASi\n& high BBs"),
+                       ACE_BB_30dcat = fct_relevel(as_factor(ifelse(ACE_bin_30d == "high RAASi" & BB_bin_30d == "high BBs", "high RAASi\n& high BBs", 
+                                  ifelse(ACE_bin_30d == "high RAASi" & BB_bin_30d == "low BBs", "high RAASi\n& low BBs",
+                                  ifelse(ACE_bin_30d == "low RAASi" & BB_bin_30d == "high BBs", "low RAASi\n& high BBs", "low RAASi\n& low BBs")))), "low RAASi\n& low BBs", "high RAASi\n& low BBs", "low RAASi\n& high BBs"))
+```
+
+```{r}
+## for 30-day death
+OR_ACE_BB_d30d <- data.frame(Group = as_factor(levels(DATA$ACE_BB_30dcat)),
+                             N = rep(NA,4),
+                             Nval = rep(NA,4),
+                             Group_N = rep(NA, 4),
+                             logOdds = rep(NA,4),
+                             lowCI = rep(NA,4),
+                             upCI = rep(NA,4),
+                             OR_CI = rep(NA,4),
+                             p = rep(NA,4),
+                             pval = rep(NA,4),
+                            check.names = FALSE)
+
+DAT_ACE_BB_30dcat <- na.omit(DATA[,c("number_follow_up", "death_30_all", "ACE_BB_30dcat")])
+
+OR_ACE_BB_d30d$N <- paste0("N=",table(DAT_ACE_BB_30dcat$ACE_BB_30dcat))
+OR_ACE_BB_d30d$Nval <- table(DAT_ACE_BB_30dcat$ACE_BB_30dcat)
+OR_ACE_BB_d30d$Group_N <- as_factor(paste0(OR_ACE_BB_d30d$Group,"\n", OR_ACE_BB_d30d$N))
+
+es_ACE_BB_30dcat <- escalc(
+  xi= death_30_all,
+  ni = number_follow_up,
+  data = DAT_ACE_BB_30dcat, 
+  measure = "PLO",
+  to="if0all")
+
+# model to get estimates
+full_ACE_BB_30dcat <- rma(yi = yi, vi = vi, mods = ~ACE_BB_30dcat, data = es_ACE_BB_30dcat, method = "REML")
+
+OR_ACE_BB_d30d$logOdds <- c(0, full_ACE_BB_30dcat$b[-1])
+OR_ACE_BB_d30d$lowCI <- c(0, full_ACE_BB_30dcat$ci.lb[-1])
+OR_ACE_BB_d30d$upCI <- c(0, full_ACE_BB_30dcat$ci.ub[-1])
+OR_ACE_BB_d30d$OR_CI <- paste0(round(exp(OR_ACE_BB_d30d$logOdds),2)," (", round(exp(OR_ACE_BB_d30d$lowCI),2)," - ", round(exp(OR_ACE_BB_d30d$upCI),2),")")
+OR_ACE_BB_d30d$p <- c(NA, paste0("p=", round(full_ACE_BB_30dcat$pval[-1], 3)))
+OR_ACE_BB_d30d$pval <- c(NA, round(full_ACE_BB_30dcat$pval[-1], 3))
+
+
+#Significance test
+full_ACE_BB_30dcat_ML <- rma(yi = yi, vi = vi, mods = ~ACE_BB_30dcat, data = es_ACE_BB_30dcat, method = "ML")
+red_ACE_BB_30dcat_ML <- rma(yi = yi, vi = vi, data = es_ACE_BB_30dcat, method = "ML")
+ovp_ACE_BB_30dcat <-paste0("Overall p= ", round(anova(full_ACE_BB_30dcat_ML,red_ACE_BB_30dcat_ML)[6]$pval,3)) 
+
+OR_ACE_BB_30d_plot <- ggplot(data = OR_ACE_BB_d30d, aes(x = Group_N, y = logOdds)) +
+          geom_pointrange(aes(ymin = lowCI, ymax = upCI), size = 4) +
+          geom_hline(yintercept = 0, linetype = 2) +
+          geom_text(aes(y = 0.35, label = p), size = 10) +
+          geom_text(aes(x = 1.2, y = -1.1, label = ovp_ACE_BB_30dcat), size = 10) +
+          theme_classic() + labs(x = "Treatment group", y = "Log odds (95% CI)", title = "30-day death") +
+          theme(axis.title.x = element_text( face="bold", size=35),
+               axis.title.y = element_text( face="bold", size=35),
+               axis.text.x = element_text(face="bold", size=30),
+               axis.text.y = element_text(face="bold", size=30),
+               plot.title = element_text(face = "bold",size = 40, hjust = 0.5),
+               legend.position = "none")
+
+
+## for 1 year death
+OR_ACE_BB_d1y <- data.frame(Group = as_factor(levels(DATA$ACE_BB_1ycat)),
+                             N = rep(NA,4),
+                            Nval = rep(NA, 4),
+                             Group_N = rep(NA,4),
+                             logOdds = rep(NA,4),
+                             lowCI = rep(NA,4),
+                             upCI = rep(NA,4),
+                             OR_CI = rep(NA,4),
+                             p = rep(NA,4),
+                            pval = rep(NA,4),
+                            check.names = FALSE)
+
+DAT_ACE_BB_1ycat <- na.omit(DATA[,c("number_follow_up", "death_365", "ACE_BB_1ycat")])
+
+OR_ACE_BB_d1y$N <- paste0("N=",table(DAT_ACE_BB_1ycat$ACE_BB_1ycat))
+OR_ACE_BB_d1y$Nval <- table(DAT_ACE_BB_1ycat$ACE_BB_1ycat)
+OR_ACE_BB_d1y$Group_N <- as_factor(paste0(OR_ACE_BB_d1y$Group,"\n", OR_ACE_BB_d1y$N))
+
+es_ACE_BB_1ycat <- escalc(
+  xi= death_365,
+  ni = number_follow_up,
+  data = DAT_ACE_BB_1ycat, 
+  measure = "PLO",
+  to="if0all")
+
+# model to get estimates
+full_ACE_BB_1ycat <- rma(yi = yi, vi = vi, mods = ~ACE_BB_1ycat, data = es_ACE_BB_1ycat, method = "REML")
+
+OR_ACE_BB_d1y$logOdds <- c(0, full_ACE_BB_1ycat$b[-1])
+OR_ACE_BB_d1y$lowCI <- c(0, full_ACE_BB_1ycat$ci.lb[-1])
+OR_ACE_BB_d1y$upCI <- c(0, full_ACE_BB_1ycat$ci.ub[-1])
+OR_ACE_BB_d1y$OR_CI <- paste0(round(exp(OR_ACE_BB_d1y$logOdds),2)," (", round(exp(OR_ACE_BB_d1y$lowCI),2)," - ", round(exp(OR_ACE_BB_d1y$upCI),2),")")
+OR_ACE_BB_d1y$p <- c(NA, paste0("p=", round(full_ACE_BB_1ycat$pval[-1], 3)))
+OR_ACE_BB_d1y$pval <- c(NA, round(full_ACE_BB_1ycat$pval[-1], 3))
+
+
+#Significance test
+full_ACE_BB_1ycat_ML <- rma(yi = yi, vi = vi, mods = ~ACE_BB_1ycat, data = es_ACE_BB_1ycat, method = "ML")
+red_ACE_BB_1ycat_ML <- rma(yi = yi, vi = vi, data = es_ACE_BB_1ycat, method = "ML")
+ovp_ACE_BB_1ycat <- paste0("Overall p= ", round(anova(full_ACE_BB_1ycat_ML,red_ACE_BB_1ycat_ML)[6]$pval,3))
+
+OR_ACE_BB_1y_plot <- ggplot(data = OR_ACE_BB_d1y, aes(x = Group_N, y = logOdds)) +
+          geom_pointrange(aes(ymin = lowCI, ymax = upCI), size = 4) +
+          geom_hline(yintercept = 0, linetype = 2) +
+          geom_text(aes(y = 0.8, label = p), size = 10) +
+          geom_text(aes(x = 1.2, y = -0.6, label = ovp_ACE_BB_1ycat), size = 10) +
+          theme_classic() + labs(x = "Treatment group", y = "Log odds (95% CI)", title = "One-year death") +
+          theme(axis.title.x = element_text( face="bold", size=35),
+               axis.title.y = element_text( face="bold", size=35),
+               axis.text.x = element_text(face="bold", size=30),
+               axis.text.y = element_text(face="bold", size=30),
+               plot.title = element_text(face = "bold",size = 40, hjust = 0.5),
+               legend.position = "none")
+```
+
+```{r include = FALSE}
+fig_abs <- (OR_ACE_BB_30d_plot + OR_ACE_BB_1y_plot) + plot_annotation(tag_levels = 'A') & theme(plot.tag = element_text(size = 30))
+fig_abs
+```
+
+```{r eval = FALSE}
+ggsave("figures/Fig_abstract.tiff", width = 70, height = 25, units = "cm", dpi = 300)
+```
+
+```{r}
+comb_OR_ACR_BB <- bind_cols(
+              OR_ACE_BB_d30d %>% dplyr::select(Group, Nval, OR_CI, pval),
+              OR_ACE_BB_d1y %>% dplyr::select(Nval, OR_CI, pval)) %>%
+            mutate(Group = ifelse(Group == "low RAASi\n& low BBs", 
+                                            "low RAASi & low BBs", 
+                          ifelse(Group == "high RAASi\n& low BBs",
+                                            "high RAASi & low BBs",
+                          ifelse(Group == "low RAASi\n& high BBs",
+                                          "low RAASi & high BBs",
+                                          "high RAASi & high BBs"))))
+
+typo_OR_ACE_BB <- data.frame(col_keys = colnames(comb_OR_ACR_BB), 
+                       type = c("", rep(paste0("30-day death\n", ovp_ACE_BB_30dcat), 3), rep(paste0("One-year death\n", ovp_ACE_BB_1ycat), 3)),
+                       col = c("Group", rep(c("N", "OR (CI)", "P-value"), 2)), stringsAsFactors = FALSE)
+
+
+flextable(comb_OR_ACR_BB) %>%
+                    set_caption("Table S5: Odds-ratio (95% CI) and p-values for the combined effect of RAASi and BBs at admission on 30-day and one-year all-cause death.") %>%
+                    set_header_df(mapping = typo_OR_ACE_BB, key = "col_keys") %>% 
+                    merge_h(part = "header") %>% 
+                    theme_booktabs() %>% 
+                   # autofit() %>% 
+                    bold(part = "header") %>% 
+                    align(j = c(2:7), align = "center", part = "all") %>%
+                    align(j = 1, align = "left", part = "all") %>%
+                    add_footer(`Group` = "For these analyses, four-class variable describing the combination of high and low (i.e. above and below the median, respectively) percentages of prescription of RAASi and BBs was created. ") %>% 
+                   merge_at(j = 1:7, part = "footer") %>% 
+                  width(j = ~ OR_CI...3 + OR_CI...6, width = 4) %>% 
+                  width(j = ~ Group, width = 0.4)
+```
+
+
+## Table S6: Summary table for the effect of cardiovascular treatments at admission on 30-day and one-year readmission
+
+```{r}
+## Effects of cardiovascular treatments on 30-day readmission
+
+# ACEi and/or ARB (RAASi)
+admACEi_readm_30d <- MA_prop_plot_adj("number_follow_up", "ACE_ARB_admrate_100", "TIME", "type_Obsv_0_trial_1", "mono0_multi1", "rehosp_30_all.cause_all", seq(from = 20, to = 90, by = 5), 2003, "RAASi (%)", "30-day readmission (%)", c(0,40), "",0.1)
+# not adjusted
+
+# Diuretics
+admdiur_readm_30d <- MA_prop_plot_adj("number_follow_up", "diur_admrate_100", "TIME", "type_Obsv_0_trial_1", "mono0_multi1", "rehosp_30_all.cause_all", seq(from = 30, to = 100, by = 5), 2003, "Diuretics (%)", "30-day readmission (%)", c(0,40), "",0.1)
+# not adjusted
+
+# Beta-blockers
+admBB_readm_30d <- MA_prop_plot_adj("number_follow_up", "BB_admrate_100", "TIME", "type_Obsv_0_trial_1", "mono0_multi1", "rehosp_30_all.cause_all", seq(from = 10, to = 100, by = 5), 2003, "Beta-blocker (%)", "30-day readmission (%)", c(0,40), "",0.1)
+# not adjusted
+
+# Digoxin
+admdigo_readm_30d <- MA_prop_plot_adj("number_follow_up", "digox_admrate_100", "TIME", "type_Obsv_0_trial_1", "mono0_multi1", "rehosp_30_all.cause_all", seq(from = 5, to = 60, by = 5), 2003,  "Digoxin (%)", "30-day readmission (%)", c(0,40), "", 0.1)
+# not adjusted
+```
+
+```{r}
+## Effects of cardiovascular treatments on 1-year readmission
+
+# ACEi and/or ARB (RAASi)
+admACEi_readm_1y <- MA_prop_plot_adj("number_follow_up", "ACE_ARB_admrate_100", "TIME", "type_Obsv_0_trial_1", "mono0_multi1", "rehosp_365", seq(from = 20, to = 90, by = 5), 2003, "RAASi (%)", "One-year readmission (%)", c(0,40), "",0.1)
+# not adjusted
+
+# Diuretics
+admdiur_readm_1y <- MA_prop_plot_adj("number_follow_up", "diur_admrate_100", "TIME", "type_Obsv_0_trial_1", "mono0_multi1", "rehosp_365", seq(from = 30, to = 100, by = 5), 2003, "Diuretics (%)", "One-year readmission (%)", c(0,40), "",0.1)
+# not adjusted
+
+# Beta-blockers
+admBB_readm_1y <- MA_prop_plot_adj("number_follow_up", "BB_admrate_100", "TIME","type_Obsv_0_trial_1", "mono0_multi1", "rehosp_365", seq(from = 10, to = 100, by = 5), 2003, "Beta-blocker (%)", "One-year readmission (%)", c(0,40), "", 0.1)
+# not adjusted
+
+# Digoxin
+admdigo_readm_1y <- MA_prop_plot_adj("number_follow_up", "digox_admrate_100", "TIME", "type_Obsv_0_trial_1", "mono0_multi1", "rehosp_365", seq(from = 5, to = 60, by = 5), 2003,  "Digoxin (%)", "One-year readmission (%)", c(0,40), "",0.1)
+# not adjusted
+```
+
+
+```{r}
+summ_ttt_adm_readm <- data.frame(Treatment = c("RAASi", "Diuretics", "Beta-blockers", "Digoxin"), 
+                           "OR (CI)" = c(admACEi_readm_30d[[5]][[1]], admdiur_readm_30d[[5]][[1]], admBB_readm_30d[[5]][[1]], admdigo_readm_30d[[5]][[1]]), 
+                           "P-value" = round(c(admACEi_readm_30d[[5]]$pval, admdiur_readm_30d[[5]]$pval, admBB_readm_30d[[5]]$pval, admdigo_readm_30d[[5]]$pval),3),
+                           "OR (CI) " = c(admACEi_readm_1y[[5]][[1]], admdiur_readm_1y[[5]][[1]], admBB_readm_1y[[5]][[1]], admdigo_readm_1y[[5]][[1]]), 
+                           "P-value " = round(c(admACEi_readm_1y[[5]]$pval, admdiur_readm_1y[[5]]$pval, admBB_readm_1y[[5]]$pval, admdigo_readm_1y[[5]]$pval),3), check.names = FALSE)
+
+typo_adm_readm <- data.frame(col_keys = colnames(summ_ttt_adm_readm), 
+                       type = c("", rep("30-day readmission", 2), rep("One-year readmission", 2)),
+                       col = c("Treatment", rep(c("OR (CI)", "P-value"), 2)), stringsAsFactors = FALSE)
+
+flx_summ_ttt_adm_readm <-  flextable(summ_ttt_adm_readm) %>%
+                    autofit() %>% 
+                    set_caption("Table S6: Odds-ratio (CI) and p-value for the effects of cardiovascular treatments at admission on 30-day and 1-year all-cause readmission") %>%
+                    set_header_df(mapping = typo_adm_readm, key = "col_keys") %>% 
+                    merge_h(part = "header") %>% 
+                    merge_v(part = "header") %>% 
+                    theme_booktabs() %>% 
+                    bold(part = "header") %>% 
+                    align(j = c(2:5), align = "center", part = "all") %>%
+                    align(j = 1, align = "left", part = "all") %>%
+                    add_footer(`Treatment` = "For all analyses, recruitment year was included as a moderator.") %>% 
+                   merge_at(j = 1:5, part = "footer") 
+  
+flx_summ_ttt_adm_readm %>% width(width = dim(.)$widths * 10 / sum(dim(.)$widths)) # setting column width for a maximum width of 10 inches
+```
+
+Odds-ratio are calculated using a 10% increment of cardiovascular treatments.
+
+
+## Figure S4: Sensitivity analysis according to different pre-specified subgroups
+
+We want to compare the effect of year of recruitment found in the global population with the effect in subgroups (using a model with interaction between group variable and year of recruitment): observational vs trial, mono- vs multicentric, outcomes assessed from discharge vs from admission, without Medicare studies.
+The effect of year of recruitment will be expressed as an odds ratio for a 10-year increment, 95% CI.
+
+```{r}
+# recoding subgroup variable more explicitely
+DATA <- DATA %>% mutate(mono0_multi1 = recode_factor(DATA$mono0_multi1, 
+                                          '0' = "Monocentric", 
+                                          '1' = "Multicentric"),
+                        d_adm_dis = recode_factor(DATA$d_adm_dis, 
+                                          '0' = "Admission", 
+                                          '1' = "Discharge",
+                                          'adm' = "Admission"),
+                        type_Obsv_0_trial_1 = recode_factor(type_Obsv_0_trial_1, 
+                                          '0' = "Survey", 
+                                          '1' = "Trial"))
+```
+
+```{r}
+# subgroup analyses for 30-day death rates
+OR_d30d_type <- OR_group_fun("TIME", "death_30_all", "type_Obsv_0_trial_1", "Trial")
+OR_d30d_monomulti <- OR_group_fun("TIME", "death_30_all", "mono0_multi1", "Multicentric")
+OR_d30d_admdis <- OR_group_fun("TIME", "death_30_all", "d_adm_dis", "Discharge")
+OR_d30d_medicare <- OR_group_fun("TIME", "death_30_all", "MEDICARE", "Medicare")
+
+OR_d30d_global <- data.frame(Group = "Global", N = nrow(d30d_recruit[[4]]$X), OR = exp(d30d_recruit[[4]]$b[2]), lowCI = exp(d30d_recruit[[4]]$ci.lb[2]), upCI = exp(d30d_recruit[[4]]$ci.ub[2]), p = NA, I2 = NA)
+
+OR_d30d <- bind_rows(OR_d30d_type, OR_d30d_monomulti, OR_d30d_admdis, OR_d30d_medicare, OR_d30d_global) %>% mutate(pos = c(2, 2.5, 3.5, 4, 5, 5.5, 6.5, 7, 1))
+
+plot_OR_d30d <- ggplot(OR_d30d, aes(x = pos, y = OR, ymin = lowCI, ymax = upCI)) +
+    geom_pointrange(size = 2) + scale_y_log10(limits = c(0.25,10.5)) +
+  geom_hline(yintercept = 1, lty = 2) +  # add a dotted line at x=1 after flip
+  scale_x_continuous(breaks = OR_d30d$pos, label = OR_d30d$Group)+
+  geom_text(aes(x = pos, y = 4.5, label = N), size = 8) +
+  geom_text(aes(x = 7.5, y = 4.5, label = "N studies"), size = 8) +
+  geom_text(aes(x = pos, y = 8, label = p), size = 8) +
+  geom_text(aes(x = 7.5, y = 8, label = "P"), size = 8) +
+  coord_flip() +  # flip coordinates (puts labels on y axis)
+  xlab("death") + ylab("Odds-ratio for the effect\n of year of recruitment\n  (10-year increment, CI)") +
+  theme_classic() + theme(plot.title = element_text(size=30, face = "bold", hjust = 0.5),
+                          axis.title.y = element_text(size=30, face = "bold"),
+                          axis.title.x = element_text( face="bold", size=25),
+                          axis.text.x = element_text(face="bold", size=30),
+                          axis.text.y = element_text(face="bold", size=30)) +
+  ggtitle("30-day")
+
+
+# subgroup analyses for 1-year death rates
+OR_d1y_type <- OR_group_fun("TIME", "death_365", "type_Obsv_0_trial_1", "Trial")
+OR_d1y_monomulti <- OR_group_fun("TIME", "death_365", "mono0_multi1", "Multicentric")
+OR_d1y_admdis <- OR_group_fun("TIME", "death_365", "d_adm_dis", "Discharge")
+OR_d1y_medicare <- OR_group_fun("TIME", "death_365", "MEDICARE", "Medicare")
+
+OR_d1y_global <- data.frame(Group = "Global", N = nrow(d1y_recruit[[4]]$X), OR = exp(d1y_recruit[[4]]$b[2]), lowCI = exp(d1y_recruit[[4]]$ci.lb[2]), upCI = exp(d1y_recruit[[4]]$ci.ub[2]))
+
+OR_d1y <- bind_rows(OR_d1y_type, OR_d1y_monomulti, OR_d1y_admdis, OR_d1y_medicare, OR_d1y_global) %>% mutate(pos = c(2, 2.5, 3.5, 4, 5, 5.5, 6.5, 7, 1))
+
+plot_OR_d1y <- ggplot(OR_d1y, aes(x = pos, y = OR, ymin = lowCI, ymax = upCI)) +
+    geom_pointrange(size = 2) + scale_y_log10(limits = c(0.25, 10.5)) +
+  geom_hline(yintercept = 1, lty = 2) +  # add a dotted line at x=1 after flip
+  scale_x_continuous(breaks = OR_d1y$pos, label = OR_d1y$Group)+
+  geom_text(aes(x = pos, y = 4.5, label = N), size = 8) +
+  geom_text(aes(x = 7.5, y = 4.5, label = "N studies"), size = 8) +
+    geom_text(aes(x = pos, y = 8, label = p), size = 8) +
+  geom_text(aes(x = 7.5, y = 8, label = "P"), size = 8) +
+  coord_flip() +  # flip coordinates (puts labels on y axis)
+  xlab("") + ylab("Odds-ratio for the effect\n of year of recruitment\n  (10-year increment, CI)") +
+  theme_classic() + theme(plot.title = element_text(size=30, face = "bold", hjust = 0.5),
+                          axis.title.y = element_text(size=30, face = "bold"),
+                          axis.title.x = element_text( face="bold", size=25),
+                          axis.text.x = element_text(face="bold", size=30),
+                          axis.text.y = element_text(face="bold", size=30)) +
+  ggtitle("one-year")
+
+
+# subgroup analyses for 30-day readmission rates
+OR_r30d_type <- OR_group_fun("TIME", "rehosp_30_all.cause_all", "type_Obsv_0_trial_1", "Trial")
+OR_r30d_monomulti <- OR_group_fun("TIME", "rehosp_30_all.cause_all", "mono0_multi1", "Multicentric")
+OR_r30d_medicare <- OR_group_fun("TIME", "rehosp_30_all.cause_all", "MEDICARE", "Medicare")
+
+OR_r30d_global <- data.frame(Group = "Global", N = nrow(r30d_recruit[[4]]$X), OR = exp(r30d_recruit[[4]]$b[2]), lowCI = exp(r30d_recruit[[4]]$ci.lb[2]), upCI = exp(r30d_recruit[[4]]$ci.ub[2]))
+
+OR_r30d <- bind_rows(OR_r30d_type, OR_r30d_monomulti, OR_r30d_medicare, OR_r30d_global) %>% mutate(pos = c(2, 2.5, 3.5, 4, 5, 5.5, 1))
+
+plot_OR_r30d <- ggplot(OR_r30d, aes(x = pos, y = OR, ymin = lowCI, ymax = upCI)) +
+    geom_pointrange(size = 2) + scale_y_log10(limits = c(0.25, 10.5)) +
+  geom_hline(yintercept = 1, lty = 2) +  # add a dotted line at x=1 after flip
+  scale_x_continuous(breaks = OR_r30d$pos, label = OR_r30d$Group)+
+  geom_text(aes(x = pos, y = 4.5, label = N), size = 8) +
+  geom_text(aes(x = 6, y = 4.5, label = "N studies"), size = 8) +
+  geom_text(aes(x = pos, y = 8, label = p), size = 8) +
+  geom_text(aes(x = 6, y = 8, label = "P"), size = 8) +
+  coord_flip() +  # flip coordinates (puts labels on y axis)
+  xlab("readmission") + ylab("Odds-ratio for the effect\n of year of recruitment\n  (10-year increment, CI)") +
+  theme_classic() + theme(plot.title = element_text(size=30, face = "bold", hjust = 0.5),
+                          axis.title.y = element_text(size=30, face = "bold"),
+                          axis.title.x = element_text( face="bold", size=25),
+                          axis.text.x = element_text(face="bold", size=30),
+                          axis.text.y = element_text(face="bold", size=30))
+
+# subgroup analyses for 1-year readmission rates
+OR_r1y_type <- OR_group_fun("TIME", "rehosp_365", "type_Obsv_0_trial_1", "Trial")
+OR_r1y_monomulti <- OR_group_fun("TIME", "rehosp_365", "mono0_multi1", "Multicentric")
+OR_r1y_medicare <- OR_group_fun("TIME", "rehosp_365", "MEDICARE", "Medicare")
+
+OR_r1y_global <- data.frame(Group = "Global", N = nrow(r1y_recruit[[4]]$X), OR = exp(r1y_recruit[[4]]$b[2]), lowCI = exp(r1y_recruit[[4]]$ci.lb[2]), upCI = exp(r1y_recruit[[4]]$ci.ub[2]))
+
+OR_r1y <- bind_rows(OR_r1y_type, OR_r1y_monomulti, OR_r1y_medicare, OR_r1y_global) %>% mutate(pos = c(2, 2.5, 3.5, 4, 5, 5.5, 1))
+OR_r1y[6,3:5] <- c(NA,NA,NA)
+
+plot_OR_r1y <- ggplot(OR_r1y, aes(x = pos, y = OR, ymin = lowCI, ymax = upCI)) +
+    geom_pointrange(size = 2) + scale_y_log10(limits = c(0.25, 10.5)) +
+  geom_hline(yintercept = 1, lty = 2) +  # add a dotted line at x=1 after flip
+  scale_x_continuous(breaks = OR_r1y$pos, label = OR_r1y$Group)+
+  geom_text(aes(x = pos, y = 4.5, label = N), size = 8) +
+  geom_text(aes(x = 6, y = 4.5, label = "N studies"), size = 8) +
+    geom_text(aes(x = pos, y = 8, label = p), size = 8) +
+  geom_text(aes(x = 6, y = 8, label = "P"), size = 8) +
+  coord_flip() +  # flip coordinates (puts labels on y axis)
+  xlab("") + ylab("Odds-ratio for the effect\n of year of recruitment\n  (10-year increment, CI)") +
+  theme_classic() + theme(plot.title = element_text(size=30, face = "bold", hjust = 0.5),
+                          axis.title.y = element_text(size=30, face = "bold"),
+                          axis.title.x = element_text( face="bold", size=25),
+                          axis.text.x = element_text(face="bold", size=30),
+                          axis.text.y = element_text(face="bold", size=30))
+```
+
+```{r fig.width=20, fig.height=20}
+figS4 <- (plot_OR_d30d + plot_OR_d1y) / (plot_OR_r30d + plot_OR_r1y) + plot_annotation(tag_levels = 'A') & 
+  theme(plot.tag = element_text(size = 30))
+figS4
+```
+
+```{r eval = FALSE}
+ggsave("figures/Fig_S4_subgroup_outcomes.tiff", width = 50, height = 40, units = "cm", dpi = 300)
+ggsave("figures/Fig_S4_subgroup_outcomes.jpg", width = 50, height = 40, units = "cm", dpi = 300)
+```
+
+
+# Subgroup analyses 
+
+We want to look at the effect of year of recruitment on 30-day and one-year death in different subgroups from clinically relevant variables accounting for the severity of AHF.
+
+## Table S7: For 30-day all-cause mortality
+
+
+```{r}
+DATA <- DATA %>% 
+              mutate(AGE_fac = fct_relevel(as_factor(ifelse(AGE_bin == 0, "Age < 74 yrs", "Age >= 74 yrs")), "Age < 74 yrs"),
+                     SR_fac = fct_relevel(as_factor(ifelse(SR_bin == 0, "Male ratio < 52%", "Male ratio >= 52%")), "Male ratio < 52%"),
+                     SBP_fac = fct_relevel(as_factor(ifelse(SBP_bin == 0, "SBP < 135 mmHg", "SBP >= 135 mmHg")), "SBP < 135 mmHg"),
+                     HR_fac = fct_relevel(as_factor(ifelse(HR_bin == 0, "HR < 87 bpm", "HR >= 87 bpm")), "HR < 87 bpm"),
+                     EF_fac = fct_relevel(as_factor(ifelse(EF_bin == 0, "EF < 40%", "EF >= 40%")), "EF < 40%"))
+
+age_d30d <- sub_OR_group_fun("number_follow_up", "TIME", "death_30_all", "AGE_fac", "Age >= 74 yrs", "Age")
+
+SR_d30d <- sub_OR_group_fun("number_follow_up", "TIME", "death_30_all", "SR_fac", "Male ratio >= 52%", "Male ratio")
+
+SBP_d30d <- sub_OR_group_fun("number_follow_up", "TIME", "death_30_all", "SBP_fac", "SBP >= 135 mmHg", "Systolic blood pressure")
+
+HR_d30d <- sub_OR_group_fun("number_follow_up", "TIME", "death_30_all", "HR_fac", "HR >= 87 bpm", "Heart rate")
+
+EF_d30d <- sub_OR_group_fun("number_follow_up", "TIME", "death_30_all", "EF_fac", "EF >= 40%", "Ejection fraction")
+
+sub_tab_30d <- bind_rows(age_d30d, SR_d30d, SBP_d30d, HR_d30d, EF_d30d)
+
+```
+
+```{r}
+flx_sub_tab_30d <-  flextable(sub_tab_30d) %>%
+                    autofit() %>% 
+                    set_caption("Table S7: Odds-ratios (CI) and p-values for the effects of year of recruitment (10 year increment) on 30-day all-cause death in subgroups from clinically relevant variables accounting for severity of AHF") %>%
+                    bold(part = "header") %>% 
+                    align(j = c(3:8), align = "center", part = "all") %>%
+                    align(j = c(1,2), align = "left", part = "all")
+  
+flx_sub_tab_30d %>% width(width = dim(.)$widths * 10 / sum(dim(.)$widths)) # setting column width for a maximum width of 10 inches
+```
+
+
+## Table S8: For one-year all-cause mortality
+
+
+```{r}
+age_d1y <- sub_OR_group_fun("number_follow_up", "TIME", "death_365", "AGE_fac", "Age >= 74 yrs", "Age")
+
+SR_d1y <- sub_OR_group_fun("number_follow_up", "TIME", "death_365", "SR_fac", "Male ratio >= 52%", "Male ratio")
+
+SBP_d1y <- sub_OR_group_fun("number_follow_up", "TIME", "death_365", "SBP_fac", "SBP >= 135 mmHg", "Systolic blood pressure")
+
+HR_d1y <- sub_OR_group_fun("number_follow_up", "TIME", "death_365", "HR_fac", "HR >= 87 bpm", "Heart rate")
+
+EF_d1y <- sub_OR_group_fun("number_follow_up", "TIME", "death_365", "EF_fac", "EF >= 40%", "Ejection fraction")
+
+sub_tab_1y <- bind_rows(age_d1y, SR_d1y, SBP_d1y, HR_d1y, EF_d1y)
+
+```
+
+```{r}
+flx_sub_tab_1y <-  flextable(sub_tab_1y) %>%
+                    autofit() %>% 
+                    set_caption("Table S8: Odds-ratios (CI) and p-values for the effects of year of recruitment (10 year increment) on one-year all-cause death in subgroups from clinically relevant variables accounting for severity of AHF") %>%
+                    bold(part = "header") %>% 
+                    align(j = c(3:8), align = "center", part = "all") %>%
+                    align(j = c(1,2), align = "left", part = "all")
+  
+flx_sub_tab_1y %>% width(width = dim(.)$widths * 10 / sum(dim(.)$widths)) # setting column width for a maximum width of 10 inches
+```
+
+
+## Table S9: For 30-day all-cause readmission
+
+```{r}
+age_r30d <- sub_OR_group_fun("number_follow_up", "TIME", "rehosp_30_all.cause_all", "AGE_fac", "Age >= 74 yrs", "Age")
+
+SR_r30d <- sub_OR_group_fun("number_follow_up", "TIME", "rehosp_30_all.cause_all", "SR_fac", "Male ratio >= 52%", "Male ratio")
+
+SBP_r30d <- sub_OR_group_fun("number_follow_up", "TIME", "rehosp_30_all.cause_all", "SBP_fac", "SBP >= 135 mmHg", "Systolic blood pressure")
+
+HR_r30d <- sub_OR_group_fun("number_follow_up", "TIME", "rehosp_30_all.cause_all", "HR_fac", "HR >= 87 bpm", "Heart rate")
+
+EF_r30d <- sub_OR_group_fun("number_follow_up", "TIME", "rehosp_30_all.cause_all", "EF_fac", "EF >= 40%", "Ejection fraction")
+
+sub_tab_r30d <- bind_rows(age_r30d, SR_r30d, SBP_r30d, HR_r30d, EF_r30d)
+```
+
+```{r}
+flx_sub_tab_r30d <-  flextable(sub_tab_r30d) %>%
+                    autofit() %>% 
+                    set_caption("Table S9: Odds-ratios (CI) and p-values for the effects of year of recruitment (10 year increment) on 30-day all-cause readmission in subgroups from clinically relevant variables accounting for severity of AHF") %>%
+                    bold(part = "header") %>% 
+                    align(j = c(3:8), align = "center", part = "all") %>%
+                    align(j = c(1,2), align = "left", part = "all")
+  
+flx_sub_tab_r30d %>% width(width = dim(.)$widths * 10 / sum(dim(.)$widths)) # setting column width for a maximum width of 10 inches
+```
+
+
+## Table S10: For one-year all-cause readmission
+
+```{r}
+age_r1y <- sub_OR_group_fun("number_follow_up", "TIME", "rehosp_365", "AGE_fac", "Age >= 74 yrs", "Age")
+
+SR_r1y <- sub_OR_group_fun("number_follow_up", "TIME", "rehosp_365", "SR_fac", "Male ratio >= 52%", "Male ratio")
+
+SBP_r1y <- sub_OR_group_fun("number_follow_up", "TIME", "rehosp_365", "SBP_fac", "SBP >= 135 mmHg", "Systolic blood pressure")
+
+HR_r1y <- sub_OR_group_fun("number_follow_up", "TIME", "rehosp_365", "HR_fac", "HR >= 87 bpm", "Heart rate")
+
+EF_r1y <- sub_OR_group_fun("number_follow_up", "TIME", "rehosp_365", "EF_fac", "EF >= 40%", "Ejection fraction")
+
+sub_tab_r1y <- bind_rows(age_r1y, SR_r1y, SBP_r1y, HR_r1y, EF_r1y)
+
+```
+
+```{r}
+flx_sub_tab_r1y <-  flextable(sub_tab_r1y) %>%
+                    autofit() %>% 
+                    set_caption("Table S10: Odds-ratios (CI) and p-values for the effects of year of recruitment (10 year increment) on one-year all-cause readmission in subgroups from clinically relevant variables accounting for severity of AHF") %>%
+                    bold(part = "header") %>% 
+                    align(j = c(3:8), align = "center", part = "all") %>%
+                    align(j = c(1,2), align = "left", part = "all")
+  
+flx_sub_tab_r1y %>% width(width = dim(.)$widths * 10 / sum(dim(.)$widths)) # setting column width for a maximum width of 10 inches
+```
+
+# QOS analyses 
+
+## Figure S5: Assessment of study quality
+
+```{r echo = FALSE}
+#Data preparation
+
+qos$i.Representativeness.of.the.study.population[qos$i.Representativeness.of.the.study.population==0]<-"High"
+qos$i.Representativeness.of.the.study.population[qos$i.Representativeness.of.the.study.population==1]<-"Unclear"
+qos$i.Representativeness.of.the.study.population[qos$i.Representativeness.of.the.study.population==2]<-"Low"
+
+qos$h.Inclusion.exclusion.criteria.clearly.stated[qos$h.Inclusion.exclusion.criteria.clearly.stated==0]<-"High"
+qos$h.Inclusion.exclusion.criteria.clearly.stated[qos$h.Inclusion.exclusion.criteria.clearly.stated==1]<-"Unclear"
+qos$h.Inclusion.exclusion.criteria.clearly.stated[qos$h.Inclusion.exclusion.criteria.clearly.stated==2]<-"Low"
+qos$h.Inclusion.exclusion.criteria.clearly.stated[qos$h.Inclusion.exclusion.criteria.clearly.stated==3]<-"Low"
+
+qos$g.Clinical.and.biological.assessement.of.cohort.at.baseline[qos$g.Clinical.and.biological.assessement.of.cohort.at.baseline==0]<-"High"
+qos$g.Clinical.and.biological.assessement.of.cohort.at.baseline[qos$g.Clinical.and.biological.assessement.of.cohort.at.baseline==1]<-"Unclear"
+qos$g.Clinical.and.biological.assessement.of.cohort.at.baseline[qos$g.Clinical.and.biological.assessement.of.cohort.at.baseline==2]<-"Low"
+
+qos$f.Assessment.of.the.four.outcomes[qos$f.Assessment.of.the.four.outcomes==0]<-"High"
+qos$f.Assessment.of.the.four.outcomes[qos$f.Assessment.of.the.four.outcomes==1]<-"Unclear"
+qos$f.Assessment.of.the.four.outcomes[qos$f.Assessment.of.the.four.outcomes==2]<-"Low"
+
+qos$e.Individual.follow.up[qos$e.Individual.follow.up==0]<-"High"
+qos$e.Individual.follow.up[qos$e.Individual.follow.up==1]<-"Unclear"
+qos$e.Individual.follow.up[qos$e.Individual.follow.up==2]<-"Low"
+
+qos$d.Loss.of.follow.up.reported[qos$d.Loss.of.follow.up.reported==0]<-"High"
+qos$d.Loss.of.follow.up.reported[qos$d.Loss.of.follow.up.reported==1]<-"Unclear"
+qos$d.Loss.of.follow.up.reported[qos$d.Loss.of.follow.up.reported==2]<-"Low"
+
+qos$c.Correct.statistical.method[qos$c.Correct.statistical.method==0]<-"High"
+qos$c.Correct.statistical.method[qos$c.Correct.statistical.method==1]<-"Unclear"
+qos$c.Correct.statistical.method[qos$c.Correct.statistical.method==2]<-"Low"
+
+qos$b.Results.believable[qos$b.Results.believable==0]<-"High"
+qos$b.Results.believable[qos$b.Results.believable==1]<-"Unclear"
+qos$b.Results.believable[qos$b.Results.believable==2]<-"Low"
+
+qos$a.Funding.reported[qos$a.Funding.reported==0]<-"High"
+qos$a.Funding.reported[qos$a.Funding.reported==1]<-"Unclear"
+qos$a.Funding.reported[qos$a.Funding.reported==2]<-"Low"
+```
+
+```{r}
+a<-addmargins(table(qos$i.Representativeness.of.the.study.population,deparse.level = 2))
+b<-round(a/a[4]*100,1)
+
+a<-addmargins(table(qos$h.Inclusion.exclusion.criteria.clearly.stated))
+c<-round(a/a[4]*100,1)
+
+a<-addmargins(table(qos$g.Clinical.and.biological.assessement.of.cohort.at.baseline))
+d<-round(a/a[4]*100,1)
+
+a<-addmargins(table(qos$e.Individual.follow.up))
+e<-round(a/a[4]*100,1)
+
+a<-addmargins(table(qos$d.Loss.of.follow.up.reported))
+f<-round(a/a[4]*100,1)
+
+a<-addmargins(table(qos$b.Results.believable))
+g<-round(a/a[4]*100,1)
+
+a<-addmargins(table(qos$a.Funding.reported))
+h<-round(a/a[4]*100,1)
+
+Qos_table<-matrix(NA,7,5)
+Qos_table[1,]<-c(names(qos)[2],b)
+Qos_table[2,]<-c(names(qos)[3],c)
+Qos_table[3,]<-c(names(qos)[4],d)
+Qos_table[4,]<-c(names(qos)[6],e)
+Qos_table[5,]<-c(names(qos)[7],f)
+Qos_table[6,]<-c(names(qos)[9],g)
+Qos_table[7,]<-c(names(qos)[10],h)
+
+colnames(Qos_table)<-c("Parameters","high (%)", "low  (%)", "unclear  (%)", "sum  (%)")
+
+Qos_table<-as.data.frame(Qos_table)
+flx_sub_tab_Qos <-  flextable(Qos_table) %>%
+                    autofit() %>% 
+                    set_caption("Risk of bias rate estimated by the assessment quality tool") %>%
+                    bold(part = "header") %>% 
+                    align(j = c(2:5), align = "center", part = "all") %>%
+                    align(j = c(1), align = "left", part = "all")
+  
+flx_sub_tab_Qos %>% width(width = dim(.)$widths * 10 / sum(dim(.)$widths)) # setting column width for a maximum width of 10 inches
+```
+
+
+```{r fig.width=20, fig.height=10, results = "hide"}
+figS5<-rob.summary(qos, studies = qos$Study, table = FALSE)
+figS5
+```
+
+```{r eval = FALSE}
+ggsave("figures/Fig_S5_qos.tiff", width = 40, height = 20, units = "cm", dpi = 150)
+```
+
+Session info for this script:
+
+```{r echo = FALSE}
+sessionInfo()
+```
